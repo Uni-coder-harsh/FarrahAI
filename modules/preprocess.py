@@ -76,27 +76,83 @@ def threshold(img: np.ndarray) -> np.ndarray:
     )
 
 
-def deskew(img: np.ndarray) -> np.ndarray:
+def deskew(img: np.ndarray, max_angle: float = 10.0) -> np.ndarray:
     """
-    Deskew the image by detecting and correcting rotation angle.
-    Handles slightly tilted scans / phone photos.
+    Safely deskew a document image using horizontal projection profiles.
+
+    Key fix over the old version:
+    - Old version: used minAreaRect on ALL white pixels → catastrophic rotation
+      when thresholded image has text blocks at various positions.
+    - New version: uses Hough line detection to estimate skew angle from
+      actual text lines, then CLAMPS to ±max_angle degrees.
+
+    max_angle=10.0 means we only correct genuine slight tilts (phone photos,
+    hand-placed scans). We refuse to rotate more than that — protecting against
+    the 90° catastrophic rotation you observed.
+
+    Args:
+        img: grayscale or binary image
+        max_angle: maximum degrees to rotate (default 10°)
+
+    Returns:
+        deskewed image, or original if angle outside safe range
     """
-    coords = np.column_stack(np.where(img > 0))
-    if len(coords) == 0:
-        return img
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = -(90 + angle)
+    # Invert if needed: Hough works on edges of dark text on white background
+    # After adaptive threshold, text is black (0) on white (255)
+    # We invert to get white text on black for edge detection
+    if img.mean() > 127:
+        working = cv2.bitwise_not(img)
     else:
-        angle = -angle
+        working = img.copy()
+
+    # Detect edges
+    edges = cv2.Canny(working, 50, 150, apertureSize=3)
+
+    # Hough line detection
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=100,
+        minLineLength=img.shape[1] // 4,   # lines must span at least 1/4 width
+        maxLineGap=20
+    )
+
+    if lines is None or len(lines) == 0:
+        logger.debug("deskew: no lines detected, returning original")
+        return img
+
+    # Compute angle for each detected line
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 - x1 == 0:
+            continue   # vertical line — skip
+        angle_deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        angles.append(angle_deg)
+
+    if not angles:
+        return img
+
+    # Use median angle to be robust against outliers
+    median_angle = float(np.median(angles))
+
+    # Clamp: only correct if angle is a small tilt
+    if abs(median_angle) > max_angle:
+        logger.warning(
+            f"deskew: detected angle {median_angle:.1f}° exceeds max_angle "
+            f"({max_angle}°) — skipping rotation to prevent catastrophic flip"
+        )
+        return img
+
+    # Apply rotation
     (h, w) = img.shape[:2]
     center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
     rotated = cv2.warpAffine(
         img, M, (w, h),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE
     )
+    logger.info(f"deskew: corrected {median_angle:.2f}°")
     return rotated
 
 
@@ -112,27 +168,41 @@ def morphological_cleanup(img: np.ndarray) -> np.ndarray:
 def preprocess_image(image_path: str,
                      save_path: str = None,
                      apply_morph: bool = False,
-                     clip_limit: float = 2.0,
-                     denoise_strength: int = 10) -> np.ndarray:
+                     apply_deskew: bool = True,
+                     clip_limit: float = 1.5,
+                     denoise_strength: int = 7,
+                     max_deskew_angle: float = 10.0) -> np.ndarray:
     """
-    Full preprocessing pipeline.
+    Full preprocessing pipeline — corrected order and safe defaults.
+
+    Correct pipeline order:
+        grayscale → CLAHE → denoise → threshold → deskew → (optional morph)
+
+    Why this order?
+        - CLAHE before denoise: enhance contrast while detail still exists
+        - Denoise after CLAHE: smooth out CLAHE artifacts
+        - Threshold after denoise: cleaner binary from smooth input
+        - Deskew last on binary: Hough lines work best on clean B&W
 
     Args:
-        image_path: path to raw image
-        save_path: if given, saves the processed image here
-        apply_morph: apply morphological cleanup (optional)
-        clip_limit: CLAHE clip limit
-        denoise_strength: denoising strength
+        image_path:        path to raw image
+        save_path:         if given, saves the processed image here
+        apply_morph:       apply morphological cleanup (default off)
+        apply_deskew:      apply deskew correction (default on, safe ±10°)
+        clip_limit:        CLAHE clip limit — lower = less aggressive (1.5 default)
+        denoise_strength:  denoising strength — lower = less blurring (7 default)
+        max_deskew_angle:  max degrees to correct — prevents catastrophic rotation
 
     Returns:
         processed image as numpy array
     """
     img = load_image(image_path)
     img = to_grayscale(img)
-    img = denoise(img, strength=denoise_strength)
-    img = apply_clahe(img, clip_limit=clip_limit)
-    img = threshold(img)
-    img = deskew(img)
+    img = apply_clahe(img, clip_limit=clip_limit)        # enhance contrast first
+    img = denoise(img, strength=denoise_strength)         # then smooth
+    img = threshold(img)                                  # then binarize
+    if apply_deskew:
+        img = deskew(img, max_angle=max_deskew_angle)    # safe deskew last
     if apply_morph:
         img = morphological_cleanup(img)
 

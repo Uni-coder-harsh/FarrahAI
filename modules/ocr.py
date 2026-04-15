@@ -23,32 +23,54 @@ logger = logging.getLogger(__name__)
 def ocr_with_paddleocr(image_path: str) -> dict:
     """
     Run OCR using PaddleOCR.
+    Compatible with both older (<2.7) and newer (>=2.7) PaddleOCR APIs.
     Returns: { 'text': str, 'confidence': float, 'boxes': list }
     """
     try:
         from paddleocr import PaddleOCR
-        ocr_engine = PaddleOCR(lang='en')
+
+        # Newer PaddleOCR dropped use_angle_cls — use lang only
+        # show_log=False suppresses verbose paddle output
+        try:
+            ocr_engine = PaddleOCR(lang='en', show_log=False)
+        except TypeError:
+            # Very old version fallback
+            ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+
         result = ocr_engine.ocr(image_path)
 
-        lines = []
-        confidences = []
-        boxes = []
+        lines        = []
+        confidences  = []
+        boxes        = []
 
-        if result and result[0]:
-            for line in result[0]:
-                box, (text, conf) = line
-                lines.append(text)
-                confidences.append(conf)
-                boxes.append(box)
+        # PaddleOCR result format changed between versions:
+        # Old: result[0] = list of [box, (text, conf)]
+        # New: result[0] = list of [box, (text, conf)]  (same, but may be None)
+        pages = result if result else []
+
+        for page in pages:
+            if page is None:
+                continue
+            for item in page:
+                try:
+                    # Standard format: [box, (text, confidence)]
+                    box         = item[0]
+                    text, conf  = item[1]
+                    lines.append(str(text))
+                    confidences.append(float(conf))
+                    boxes.append(box)
+                except (IndexError, TypeError, ValueError):
+                    # Skip malformed entries silently
+                    continue
 
         full_text = "\n".join(lines)
         avg_conf  = float(np.mean(confidences)) if confidences else 0.0
 
         return {
-            "text": full_text,
+            "text":       full_text,
             "confidence": round(avg_conf, 4),
-            "boxes": boxes,
-            "engine": "paddleocr"
+            "boxes":      boxes,
+            "engine":     "paddleocr"
         }
     except ImportError:
         logger.warning("PaddleOCR not installed, falling back to Tesseract")
