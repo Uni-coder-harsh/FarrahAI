@@ -116,9 +116,18 @@ def add_paper_to_teacher(db: dict,
         topic = t.get("name", "unknown").strip().lower()
         profile["topic_frequency"][topic] = profile["topic_frequency"].get(topic, 0) + 1
 
-    # Update marks distribution
+    # Update marks distribution (ignore missing/invalid/non-positive marks)
     for t in paper_data.get("topics", []):
-        marks_key = str(t.get("marks", 0))
+        raw_marks = t.get("marks", None)
+        try:
+            marks_val = int(raw_marks)
+
+        except (TypeError, ValueError):
+            continue
+        if marks_val <= 0:
+            continue
+
+        marks_key = str(marks_val)
         if marks_key not in profile["marks_distribution"]:
             profile["marks_distribution"][marks_key] = 0
         profile["marks_distribution"][marks_key] += 1
@@ -187,7 +196,17 @@ def get_teacher_summary(teacher_name: str, db: dict) -> str:
         lines.append(f"  {t['rank']}. {t['topic']} (asked {t['count']} time(s))")
 
     lines += ["", "Marks distribution:"]
-    for marks_val, count in sorted(marks.items(), key=lambda x: int(x[0])):
+    valid_marks = []
+    for marks_val, count in marks.items():
+        try:
+            m = int(marks_val)
+        except (TypeError, ValueError):
+            continue
+        if m <= 0:
+            continue
+        valid_marks.append((m, count))
+
+    for marks_val, count in sorted(valid_marks, key=lambda x: x[0]):
         lines.append(f"  {marks_val} marks: {count} question(s)")
 
     return "\n".join(lines)
